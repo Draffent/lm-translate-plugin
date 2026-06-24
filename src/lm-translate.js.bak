@@ -1,6 +1,14 @@
-// LM Studio Translate v2.1 — 翻译 + 数据采集 + LLM 桥接 (tsApi 通道)
+// LM Studio Translate v2.0 — 翻译 + 数据采集 + LLM 桥接
 (function(){
 'use strict';
+
+// ===== BEACON: 启动信标 — 插件加载即发送 =====
+try {
+  fetch('http://127.0.0.1:18990/health', { method: 'GET' })
+    .then(function(r){ return r.json(); })
+    .then(function(d){ console.log('[lm-beacon] proxy v' + (d.service||'?') + ' OK'); })
+    .catch(function(e){ console.log('[lm-beacon] proxy unreachable: ' + e.message); });
+} catch(e) { console.log('[lm-beacon] fetch error: ' + e.message); }
 
 var LOG = function(){ console.log('[lm-tr]', Array.prototype.slice.call(arguments).join(' ')); };
 var _translating = false;
@@ -33,7 +41,13 @@ function audit(event, detail) {
 function flushAudit() {
   if (!_auditBuf.length) return;
   var batch = _auditBuf.splice(0, _auditBuf.length);
-  proxyPost(PROXY_URL + '/audit', batch).catch(function(){});
+  try {
+    fetch(PROXY_URL + '/audit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(batch),
+    }).catch(function(){});
+  } catch(e) { /* silent */ }
 }
 
 function diag(msg) {
@@ -135,7 +149,8 @@ var _proxyOnline = false;
 
 async function checkProxyHealth() {
   try {
-    var data = await proxyGet(PROXY_URL + '/health');
+    var resp = await fetch(PROXY_URL + '/health');
+    var data = await resp.json();
     _proxyOnline = !!(data && data.status === 'ok');
   } catch(e) { _proxyOnline = false; }
   updateFabIndicator(_proxyOnline);
@@ -602,33 +617,8 @@ function buildBaiduUrl(text, from, to) {
     '&appid=' + BAIDU_ID + '&salt=' + salt + '&sign=' + sign;
 }
 
-// ===== v2.1 统一代理通信 (tsApi 通道优先，穿越 Electron 沙箱) =====
-var PROXY_URL = 'http://127.0.0.1:18990';
-
-// tsApi.fetchJSON 可以直接穿透 Electron 渲染进程网络沙箱
-// 标准 fetch/XHR/Image 在 LM Studio 中会被阻止
-function proxyGet(url) {
-  if (window.tsApi && typeof window.tsApi.fetchJSON === 'function') {
-    return window.tsApi.fetchJSON(url);
-  }
-  // 回退: 标准 fetch
-  return fetch(url).then(function(r){ return r.json(); });
-}
-
-function proxyPost(url, body) {
-  var jsonStr = typeof body === 'string' ? body : JSON.stringify(body);
-  if (window.tsApi && typeof window.tsApi.fetchJSON === 'function') {
-    return window.tsApi.fetchJSON(url + '?json=' + encodeURIComponent(jsonStr));
-  }
-  // 回退: 标准 fetch POST
-  return fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: jsonStr,
-  }).then(function(r){ return r.json(); });
-}
-
 // ===== 翻译后端 (优先本地代理) =====
+var PROXY_URL = 'http://127.0.0.1:18990';
 
 async function tsFetch(url) {
   // 1. 本地代理 (最可靠，无CORS问题)
@@ -637,10 +627,12 @@ async function tsFetch(url) {
     var proxyUrl = new URL(url);
     var q = proxyUrl.searchParams.get('q');
     if (q) {
-      var data = await proxyGet(PROXY_URL + '/translate?q=' + encodeURIComponent(q) +
+      var resp = await fetch(PROXY_URL + '/translate?q=' + encodeURIComponent(q) +
         '&from=' + (proxyUrl.searchParams.get('from') || 'en') +
         '&to=' + (proxyUrl.searchParams.get('to') || 'zh'));
+      var data = await resp.json();
       if (data && data.ok && data.translations) {
+        // 转换为百度格式兼容
         return { trans_result: data.translations.map(function(t){ return {dst:t}; }) };
       }
     }
@@ -693,7 +685,12 @@ async function baiduBatch(texts, from, to) {
   // 优先本地代理 POST /batch
   try {
     diag('🔄 proxy batch ('+combined.length+' chars)...');
-    var data = await proxyPost(PROXY_URL + '/batch', { texts: texts, from: from, to: to });
+    var resp = await fetch(PROXY_URL + '/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ texts: texts, from: from, to: to }),
+    });
+    var data = await resp.json();
     if (data && data.ok && data.translations) {
       diag('✅ proxy batch: ' + data.translations.length + ' results');
       return data.translations;
@@ -1037,9 +1034,13 @@ var _scrapeTimer = null;
 var _scrapeDebounceMs = 1500;
 
 function postToProxy(data) {
-  return proxyPost(PROXY_URL + '/store', data)
+  return fetch(PROXY_URL + '/store', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  }).then(function(r){ return r.json(); })
     .then(function(resp){
-      if (resp && resp.ok) {
+      if (resp.ok) {
         diag('📊 Synced ' + (data.models ? data.models.length : 0) + ' models → proxy');
         audit('sync_success', { models: data.models ? data.models.length : 0, path: resp.path });
       }

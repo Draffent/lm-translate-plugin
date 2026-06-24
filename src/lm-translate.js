@@ -1,5 +1,4 @@
-// LM Studio 翻译增强 v7.1 — WebSocket桥接 + 诊断面板
-// 通过 ws://localhost:18999 代理网络请求，无需 CDP debug 端口
+// LM Studio Translate v2.0 — 翻译 + 数据采集 + LLM 桥接
 (function(){
 'use strict';
 
@@ -8,9 +7,40 @@ var _translating = false;
 var _translated = false;
 var _wsReady = false;
 var _ws = null;
-var _wsP = {}; // 等待响应的Promise: id → {resolve, reject, timer}
+var _wsP = {};
 var _wsSeq = 0;
-var _diagLog = []; // 诊断日志
+var _diagLog = [];
+
+// ===== v2.0 审计日志 =====
+var _auditBuf = [];
+var _auditSeq = 0;
+var _auditTimer = null;
+var _auditFlushInterval = 30000; // 30秒推送一次审计日志
+
+function audit(event, detail) {
+  var entry = {
+    seq: ++_auditSeq,
+    ts: new Date().toISOString(),
+    event: event,
+    detail: detail || {},
+    page: location.hash || '/',
+  };
+  _auditBuf.push(entry);
+  if (_auditBuf.length > 200) _auditBuf.shift();
+  if (event === 'error' || event === 'scrape_fail') flushAudit();
+}
+
+function flushAudit() {
+  if (!_auditBuf.length) return;
+  var batch = _auditBuf.splice(0, _auditBuf.length);
+  try {
+    fetch(PROXY_URL + '/audit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(batch),
+    }).catch(function(){});
+  } catch(e) { /* silent */ }
+}
 
 function diag(msg) {
   var ts = new Date().toLocaleTimeString();
@@ -59,7 +89,7 @@ function createDiagPanel() {
   var header = document.createElement('div');
   header.id = 'ts-diag-header';
   header.style.cssText = 'color:#4a9eff;font-weight:bold;margin-bottom:4px;';
-  header.textContent = '🔧 LM Translate v7.2';
+  header.textContent = '🔧 LM Translate v2.0';
   panel.appendChild(header);
   var content = document.createElement('div');
   content.id = 'ts-diag-content';
@@ -280,8 +310,180 @@ function updateIndicator() {
   }
 }
 
-// ===== 调试接口 =====
+// ===== v2.0 采集引擎 + 调试接口 =====
+
+// 从DOM提取纯文本（递归，跳过script/style）
+function extractText(el, max) {
+  if (!el || el.tagName === 'SCRIPT' || el.tagName === 'STYLE' || el.tagName === 'NOSCRIPT') return '';
+  if (max !== undefined && max <= 0) return '';
+  var txt = '';
+  for (var ci = 0; ci < el.childNodes.length; ci++) {
+    var cn = el.childNodes[ci];
+    if (cn.nodeType === 3) {
+      txt += cn.textContent;
+    } else if (cn.nodeType === 1 && cn.children.length === 0) {
+      txt += (cn.textContent || '');
+    } else if (cn.nodeType === 1) {
+      txt += extractText(cn, max !== undefined ? max - txt.length : undefined);
+    }
+    if (max !== undefined && txt.length >= max) break;
+  }
+  return txt;
+}
+
+// 从卡片DOM提取模型数据
+function extractModelCard(card, idx) {
+  var data = { id: 'card-' + idx };
+  var allText = (card.textContent || '').trim();
+
+  // 模型名称: 通常是大文本的第一个h或strong
+  var headings = card.querySelectorAll('h1,h2,h3,h4,h5,h6,strong,[class*="name"],[class*="title"]');
+  if (headings.length > 0) {
+    data.name = (headings[0].textContent || '').trim();
+  }
+
+  // 作者: 常见 pattern "by AuthorName" 或第二个 small 文本
+  var smalls = card.querySelectorAll('span,small,p');
+  for (var si = 0; si < smalls.length; si++) {
+    var st = (smalls[si].textContent || '').trim();
+    if (st.length > 3 && st.length < 60 && st !== data.name) {
+      if (!data.author && (st.indexOf('by ') === 0 || /^[A-Z][a-z]+$/.test(st) || st.indexOf('/') > 0)) {
+        data.author = st.replace(/^by /, '');
+      }
+    }
+  }
+
+  // 能力/标签
+  var tags = [];
+  var tagEls = card.querySelectorAll('[class*="tag"],[class*="badge"],[class*="pill"],span');
+  for (var ti = 0; ti < tagEls.length; ti++) {
+    var tt = (tagEls[ti].textContent || '').trim();
+    if (tt.length >= 2 && tt.length <= 25 && tt !== data.name && tt !== data.author) {
+      tags.push(tt);
+    }
+  }
+  data.tags = tags.slice(0, 12);
+  data.capabilities = [];
+
+  // 描述
+  var descEls = card.querySelectorAll('p,[class*="desc"],[class*="summary"]');
+  for (var di = 0; di < descEls.length; di++) {
+    var dt = (descEls[di].textContent || '').trim();
+    if (dt.length > 30 && dt !== data.name) {
+      data.description = dt.substring(0, 300);
+      break;
+    }
+  }
+
+  // 数字统计 (下载量、likes、size)
+  var numPattern = /(\d+\.?\d*[KMB]?)\s*(download|like|star|pull|view)/i;
+  var match = allText.match(numPattern);
+  if (match) data.downloads = match[1] + ' ' + match[2];
+
+  var sizeMatch = allText.match(/(\d+\.?\d*[KMB]?\s*(B|parameters?|params?))/i);
+  if (sizeMatch) data.size = sizeMatch[1];
+
+  // Fallback: 提取全部可见文本用作搜索
+  data.rawText = allText.substring(0, 500);
+
+  return data;
+}
+
+// 主采集函数
+function scrapeDiscover() {
+  var t0 = Date.now();
+  var result = {
+    version: '2.0',
+    page: 'discover',
+    url: location.hash || '/',
+    timestamp: new Date().toISOString(),
+    pageStats: { totalVisible: 0, scraped: 0, skipped: 0 },
+    models: [],
+  };
+
+  // 策略1: 找 model card 容器
+  var cards = document.querySelectorAll('[class*="card"],[class*="model"],[class*="item"],[class*="result"],[data-testid*="model"]');
+  var cardSet = [];
+  var seenText = new Set();
+
+  for (var ci = 0; ci < cards.length; ci++) {
+    var c = cards[ci];
+    var ct = (c.textContent || '').trim();
+    // 跳过非模型卡片（导航、侧边栏、按钮组）
+    if (ct.length < 40) continue;
+    if (ct.length > 5000) continue; // 太大的不是卡片
+    var key = ct.substring(0, 60);
+    if (seenText.has(key)) continue;
+    seenText.add(key);
+
+    // 检查是否包含典型模型特征
+    var hasModelName = /[A-Z][a-z]+[\-\d]/.test(ct) || ct.indexOf('GGUF') > -1 ||
+      ct.indexOf('model') > -1 || ct.indexOf('Model') > -1;
+    if (hasModelName || cards.length < 30) {
+      cardSet.push(c);
+    }
+  }
+
+  // 策略2: 如果策略1找到太少，扫描所有 visible blocks
+  if (cardSet.length < 3) {
+    var allDivs = document.querySelectorAll('div,section,article,li');
+    for (var di = 0; di < allDivs.length; di++) {
+      var d = allDivs[di];
+      var dt = (d.textContent || '').trim();
+      if (dt.length < 60 || dt.length > 4000) continue;
+      var dk = dt.substring(0, 60);
+      if (seenText.has(dk)) continue;
+      seenText.add(dk);
+      if (/[A-Z][a-z]+[\-\d]/.test(dt) || dt.indexOf('GGUF') > -1) {
+        cardSet.push(d);
+      }
+    }
+  }
+
+  result.pageStats.totalVisible = cardSet.length;
+  var limit = Math.min(cardSet.length, 30);
+  for (var mi = 0; mi < limit; mi++) {
+    try {
+      var model = extractModelCard(cardSet[mi], mi);
+      if (model.name || model.author || (model.tags && model.tags.length > 0)) {
+        result.models.push(model);
+      } else {
+        result.pageStats.skipped++;
+      }
+    } catch(e) {
+      result.pageStats.skipped++;
+    }
+  }
+  result.pageStats.scraped = result.models.length;
+  result.scrapeMs = Date.now() - t0;
+
+  audit('scrape_discover', { models: result.models.length, ms: result.scrapeMs });
+  return result;
+}
+
+function scrapeRuntime() {
+  var info = { gpu: 'unknown', backend: 'unknown', loadedModel: null, vramUsed: null };
+  // 尝试从页面提取 GPU 信息 (LM Studio 可能在某处显示)
+  var all = document.body.textContent || '';
+  var gpuMatch = all.match(/(AMD|NVIDIA|Intel|Radeon|GeForce|RTX|RX)\s*[A-Za-z0-9\s]+?(GPU|Graphics|Ti|XT)/i);
+  if (gpuMatch) info.gpu = gpuMatch[0].trim();
+
+  var backendMatch = all.match(/(llama\.cpp|MLX|CUDA|ROCm|Vulkan|Metal|CPU)\s*(v?[\d.]+)?/i);
+  if (backendMatch) info.backend = backendMatch[0].trim();
+
+  // VRAM
+  var vramMatch = all.match(/(\d+\.?\d*)\s*(GiB|GB|MiB|MB)\s*(free|used|VRAM)/i);
+  if (vramMatch) info.vramUsed = vramMatch[0].trim();
+
+  // Loaded model
+  var modelMatch = all.match(/(currently loaded|active model|running)[:\s]*([A-Za-z0-9\-_\.]+)/i);
+  if (modelMatch) info.loadedModel = modelMatch[2];
+
+  return info;
+}
+
 window.__ts = {
+  // v1.0 兼容
   state: function(){ return JSON.stringify({translating:_translating,translated:_translated,ws:_wsReady}); },
   test: async function(t){ try{var r=await wsTranslate(t||'hello','en','zh');return JSON.stringify(r);}catch(e){return'ERR:'+e.message;} },
   collect: function(){
@@ -293,70 +495,53 @@ window.__ts = {
       var k=t.substring(0,50);if(seen.has(k))continue;seen.add(k);items.push(t.substring(0,100));
       if(items.length>=5)break;}return JSON.stringify(items);
   },
-  debug: function(){
-    var r = [];
-    r.push("=== PAGE STRUCTURE ===");
-    r.push("URL hash: " + location.hash);
-    r.push("title: " + document.title);
-    function walk(el, depth, prefix) {
-      if (depth > 5) return;
-      if (!el || !el.tagName) return;
-      var desc = prefix + "<" + el.tagName.toLowerCase();
-      if (el.id) desc += " id=" + el.id;
-      if (el.className && typeof el.className === "string") {
-        var cls = el.className.substring(0, 40);
-        if (cls) desc += " class='" + cls + "'";
-      }
-      var directText = "";
-      for (var ci = 0; ci < el.childNodes.length; ci++) {
-        if (el.childNodes[ci].nodeType === 3) directText += el.childNodes[ci].textContent;
-      }
-      directText = directText.trim();
-      if (directText.length > 0) {
-        var en = (directText.match(/[a-zA-Z]/g)||[]).length;
-        desc += " text(" + directText.length + "c," + en + "en)='" + directText.substring(0,50).replace(/'/g,"`") + "'";
-      }
-      desc += ">";
-      if (depth >= 5) { r.push(desc + "..."); return; }
-      var kids = el.children;
-      if (kids.length > 0) {
-        desc += " [" + kids.length + " children]";
-        r.push(desc);
-        var limit = Math.min(kids.length, 8);
-        for (var ki = 0; ki < limit; ki++) {
-          walk(kids[ki], depth + 1, prefix + "  ");
-        }
-        if (kids.length > 8) r.push(prefix + "  ... (" + (kids.length - 8) + " more)");
-      } else {
-        r.push(desc);
-      }
+  debug: function(){ return JSON.stringify(scrapeDiscover()); },
+
+  // v2.0 数据采集
+  scrape: function(){
+    var data = scrapeDiscover();
+    if (data.models.length === 0) {
+      audit('scrape_empty', { page: location.hash });
     }
-    var root = document.getElementById("root") || document.body;
-    walk(root, 0, "");
-    r.push("");
-    r.push("=== ALL ENGLISH TEXT LEAVES (body) ===");
-    var seenSet = new Set();
-    var all = document.body.querySelectorAll("*");
-    var count = 0;
-    for (var i = 0; i < all.length && count < 30; i++) {
-      var el = all[i];
-      if (el.children.length > 0) continue;
-      var t = (el.textContent || "").trim();
-      if (t.length < 8 || t.length > 600) continue;
-      var en = (t.match(/[a-zA-Z]/g)||[]).length;
-      if (en < 3) continue;
-      if (seenSet.has(t.substring(0,30))) continue;
-      seenSet.add(t.substring(0,30));
-      count++;
-      r.push("<" + el.tagName.toLowerCase() +
-        (el.className && typeof el.className==="string" ? " class='" + el.className.substring(0,30) + "'" : "") +
-        "> [" + t.length + "c " + en + "en] " + t.substring(0,80).replace(/'/g,"`"));
+    // 附加运行时信息
+    data.runtime = scrapeRuntime();
+    return data;
+  },
+  scrapeDiscover: scrapeDiscover,
+  scrapeRuntime: scrapeRuntime,
+  getAuditSummary: function(){
+    return {
+      buffered: _auditBuf.length,
+      lastEntry: _auditBuf.length > 0 ? _auditBuf[_auditBuf.length - 1] : null,
+      errors: _auditBuf.filter(function(e){ return e.event === 'error' || e.event === 'scrape_fail'; }).length,
+    };
+  },
+
+  // 导出 (JSON string)
+  export: function(){
+    var data = window.__ts.scrape();
+    return JSON.stringify(data, null, 2);
+  },
+
+  // 复制到剪贴板
+  copyJSON: function(){
+    var json = window.__ts.export();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(json).then(function(){
+        audit('clipboard_copy', { size: json.length });
+        showExportToast('✅ 已复制 ' + json.length + ' 字符');
+      }).catch(function(){
+        showExportToast('❌ 复制失败，请手动选择');
+      });
+    } else {
+      // Fallback
+      var ta = document.createElement('textarea');
+      ta.value = json; ta.style.cssText = 'position:fixed;left:-9999px;';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); showExportToast('✅ 已复制'); } catch(e) { showExportToast('❌ 复制失败'); }
+      document.body.removeChild(ta);
     }
-    r.push("Total English leaves found: " + count);
-    for (var j = 0; j < Math.min(r.length, 80); j++) {
-      diag(r[j]);
-    }
-    return r.join("\n");
   },
 };
 
@@ -410,6 +595,9 @@ function md5(s){
 }
 
 // ===== 百度翻译 (preload bridge > WebSocket > direct) =====
+// SECURITY NOTE: 凭证仅用于本地127.0.0.1代理，不暴露到公网。
+// 浏览器端凭证仅用于生成sign（不直接发送），核心翻译通过代理完成。
+// 如需提升安全性，可将浏览器端凭证移除，翻译全部走代理。
 var BAIDU_ID = '20260203002552175';
 var BAIDU_KEY = 'waizdDTnFIhLvLAkCtwh';
 
@@ -832,6 +1020,116 @@ function isDiscoverPage() {
          !!findSearchInput();
 }
 
+// ===== v2.0 DataBridge — 自动采集 + 推送到代理 =====
+var _lastScrapeHash = '';
+var _scrapeTimer = null;
+var _scrapeDebounceMs = 1500;
+
+function postToProxy(data) {
+  return fetch(PROXY_URL + '/store', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  }).then(function(r){ return r.json(); })
+    .then(function(resp){
+      if (resp.ok) {
+        diag('📊 Synced ' + (data.models ? data.models.length : 0) + ' models → proxy');
+        audit('sync_success', { models: data.models ? data.models.length : 0, path: resp.path });
+      }
+      return resp;
+    })
+    .catch(function(e){
+      diag('⚠️ Sync failed: ' + e.message);
+      audit('sync_fail', { error: e.message });
+    });
+}
+
+function autoScrapeIfNeeded() {
+  if (!isDiscoverPage()) return;
+  var currentHash = location.hash || '/';
+  // 同页面不重复采集
+  if (currentHash === _lastScrapeHash) return;
+  _lastScrapeHash = currentHash;
+
+  clearTimeout(_scrapeTimer);
+  _scrapeTimer = setTimeout(function(){
+    diag('🔍 Auto-scraping...');
+    audit('auto_scrape_start', {});
+    try {
+      var data = window.__ts.scrape();
+      if (data.models && data.models.length > 0) {
+        postToProxy(data);
+      } else {
+        diag('⚠️ Scrape returned 0 models');
+        audit('scrape_empty', {});
+      }
+    } catch(e) {
+      diag('❌ Scrape error: ' + e.message);
+      audit('scrape_fail', { error: e.message });
+    }
+  }, _scrapeDebounceMs);
+}
+
+// ===== v2.0 导出 Toast =====
+var _exportToastTimer = null;
+function showExportToast(msg) {
+  var toast = document.getElementById('ts-export-toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'ts-export-toast';
+    toast.style.cssText =
+      'position:fixed;bottom:80px;right:24px;z-index:99999;'+
+      'padding:8px 18px;border-radius:8px;font-size:13px;font-weight:bold;'+
+      'background:rgba(74,158,255,0.2);color:#4a9eff;border:1px solid #4a9eff;'+
+      'pointer-events:none;transition:all 0.3s ease;opacity:0;';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.style.opacity = '1';
+  clearTimeout(_exportToastTimer);
+  _exportToastTimer = setTimeout(function(){ toast.style.opacity = '0'; }, 2000);
+}
+
+// ===== v2.0 导出按钮 =====
+function injectExportBtn() {
+  if (document.getElementById('ts-export-btn')) return;
+  var wrapper = document.getElementById('ts-fab-wrapper');
+  if (!wrapper) return;
+
+  var btn = document.createElement('button');
+  btn.id = 'ts-export-btn';
+  btn.innerHTML = '📋';
+  btn.title = '复制模型数据 JSON';
+  btn.style.cssText =
+    'cursor:pointer;width:44px;height:44px;border-radius:50%;'+
+    'border:2px solid #4a9eff;background:rgba(26,29,36,0.95);color:#4a9eff;'+
+    'font-size:18px;display:flex;align-items:center;justify-content:center;'+
+    'pointer-events:auto;transition:all 0.25s;margin-top:8px;'+
+    'backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);'+
+    'box-shadow:0 4px 20px rgba(0,0,0,0.5);';
+
+  btn.onmouseenter = function(){
+    btn.style.background='rgba(74,158,255,0.2)';
+    btn.style.boxShadow='0 6px 28px rgba(74,158,255,0.3)';
+  };
+  btn.onmouseleave = function(){
+    btn.style.background='rgba(26,29,36,0.95)';
+    btn.style.boxShadow='0 4px 20px rgba(0,0,0,0.5)';
+  };
+  btn.onclick = function(e){
+    e.preventDefault();e.stopPropagation();
+    window.__ts.copyJSON();
+  };
+
+  wrapper.appendChild(btn);
+}
+
+function updateExportBtnVisibility() {
+  var btn = document.getElementById('ts-export-btn');
+  if (!btn) return;
+  btn.style.display = isDiscoverPage() ? 'flex' : 'none';
+}
+
 // ===== FAB 浮动按钮 =====
 function createFab() {
   if (document.getElementById('ts-fab')) return document.getElementById('ts-fab');
@@ -961,12 +1259,14 @@ function updateSidebarActive() {
 // ===== 路由变化清理 =====
 function onRouteChange() {
   removeTranslations();
+  _lastScrapeHash = ''; // v2.0: 重置采集状态，允许新页面自动采集
   updateFabState();
   updateFabVisibility();
+  updateExportBtnVisibility();
   updateDiagVisibility();
   updatePageBtn();
   updateSidebarActive();
-  setTimeout(function(){ injectSearchBtn(); injectPageBtn(); injectSidebarBtn(); injectFab(); }, 800);
+  setTimeout(function(){ injectSearchBtn(); injectPageBtn(); injectSidebarBtn(); injectFab(); injectExportBtn(); }, 800);
 }
 
 // ===== 注入所有 =====
@@ -1011,6 +1311,9 @@ function waitForReady() {
     checkProxyHealth();
     scheduleDiagAutoHide(2000);
 
+    // v2.0 审计定时推送
+    _auditTimer = setInterval(function(){ flushAudit(); }, _auditFlushInterval);
+
     // 自修复轮询
     setInterval(function(){
       checkProxyHealth();
@@ -1019,7 +1322,10 @@ function waitForReady() {
       injectPageBtn();
       injectSidebarBtn();
       injectFab();
+      injectExportBtn();
+      autoScrapeIfNeeded();
       updateFabVisibility();
+      updateExportBtnVisibility();
       updateDiagVisibility();
       updateSidebarActive();
       updatePageBtn();
@@ -1030,7 +1336,8 @@ function waitForReady() {
     window.addEventListener('popstate', onRouteChange);
     window.addEventListener('hashchange', onRouteChange);
 
-    diag('v7.2 ready ✅');
+    diag('v2.0 ready ✅');
+    audit('boot', { version: '2.0' });
     return;
   }
   if (_bootAttempts < 120) setTimeout(waitForReady, 500);

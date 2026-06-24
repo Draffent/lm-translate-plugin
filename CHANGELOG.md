@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.0.0] — 2026-06-25
+
+### Added
+- **数据采集引擎** (`__ts.scrape()`): 从发现页结构化采集模型数据（名称/作者/标签/描述/下载量）
+- **自动推送**: 进入发现页 1.5 秒后自动采集 → POST /store → 代理写 JSON 文件
+- **代理存储端点**: POST /store（接收采集数据）、POST /audit（审计日志）、GET /data（读取快照）
+- **导出按钮**: FAB 旁新增 📋 按钮，一键复制模型数据 JSON 到剪贴板
+- **审计日志系统**: 记录每次采集/翻译/错误事件，30 秒批量推送，支持 `__ts.getAuditSummary()`
+- **增强健康检查**: /health 返回采集统计（次数、最后时间、错误、快照大小）
+- **运行时信息采集** (`__ts.scrapeRuntime()`): 提取 GPU/后端/VRAM/已加载模型信息
+
+### Fixed
+- `getAuditSummary` ReferenceError 修复
+- `_auditFlushInterval` 未定义变量修复
+- 诊断面板版本号从 v7.2 更正为 v2.0
+
 ## [1.0.0] — 2026-06-25
 
 ### Added

@@ -1057,15 +1057,22 @@ function autoScrapeIfNeeded() {
     audit('auto_scrape_start', {});
     try {
       var data = window.__ts.scrape();
-      if (data.models && data.models.length > 0) {
-        postToProxy(data);
-      } else {
-        diag('⚠️ Scrape returned 0 models');
-        audit('scrape_empty', {});
+      // v2.0.1: 即使 0 模型也推送，附加页面诊断信息
+      if (!data._debug) {
+        data._debug = {
+          documentTitle: document.title,
+          bodyTextLen: (document.body.textContent || '').length,
+          mainTagCount: document.querySelectorAll('main,[class*="card"],[class*="model"],[class*="item"]').length,
+          allDivs: document.querySelectorAll('div,section,article').length,
+          hash: location.hash,
+        };
       }
+      postToProxy(data);
     } catch(e) {
       diag('❌ Scrape error: ' + e.message);
       audit('scrape_fail', { error: e.message });
+      // 出错也推送错误信息
+      postToProxy({ error: e.message, page: location.hash, timestamp: new Date().toISOString() });
     }
   }, _scrapeDebounceMs);
 }

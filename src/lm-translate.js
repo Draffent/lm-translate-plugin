@@ -606,6 +606,31 @@ function buildBaiduUrl(text, from, to) {
 // ===== v2.1 统一代理通信 (tsApi 通道优先，穿越 Electron 沙箱) =====
 var PROXY_URL = 'http://127.0.0.1:18990';
 
+// 安全的 UTF-8 → base64 编码 (替代已废弃的 unescape(encodeURIComponent()))
+function utf8ToBase64(str) {
+  var bytes = [];
+  for (var i = 0; i < str.length; i++) {
+    var cp = str.charCodeAt(i);
+    if (cp < 0x80) { bytes.push(cp); }
+    else if (cp < 0x800) { bytes.push(0xC0 | (cp >> 6)); bytes.push(0x80 | (cp & 0x3F)); }
+    else if (cp >= 0xD800 && cp <= 0xDBFF) {
+      // 处理代理对 (surrogate pairs, 用于 emoji 等)
+      i++;
+      if (i < str.length) {
+        var lp = str.charCodeAt(i);
+        var c = 0x10000 + ((cp & 0x3FF) << 10) + (lp & 0x3FF);
+        bytes.push(0xF0 | (c >> 18)); bytes.push(0x80 | ((c >> 12) & 0x3F));
+        bytes.push(0x80 | ((c >> 6) & 0x3F)); bytes.push(0x80 | (c & 0x3F));
+      }
+    } else {
+      bytes.push(0xE0 | (cp >> 12)); bytes.push(0x80 | ((cp >> 6) & 0x3F)); bytes.push(0x80 | (cp & 0x3F));
+    }
+  }
+  var binary = '';
+  for (var j = 0; j < bytes.length; j++) binary += String.fromCharCode(bytes[j]);
+  return btoa(binary);
+}
+
 // tsApi.fetchJSON 可以直接穿透 Electron 渲染进程网络沙箱
 // 标准 fetch/XHR/Image 在 LM Studio 中会被阻止
 function proxyGet(url) {
@@ -626,11 +651,11 @@ function proxyPost(url, body) {
     // 大 payload: 尝试 tsApi 原生 POST（如果支持）
     // 回退: 分段发送 或 用更紧凑的编码
     try {
-      // 用 btoa 压缩（仅限 ASCII-safe JSON）
-      var b64 = btoa(unescape(encodeURIComponent(jsonStr)));
+      // 用 utf8ToBase64 压缩（不做 unescape，安全替代方案）
+      var b64 = utf8ToBase64(jsonStr);
       return window.tsApi.fetchJSON(url + '?b64=' + encodeURIComponent(b64));
     } catch(e) {
-      // btoa 失败，回退到直接 URL 编码（可能超过长度限制）
+      // base64 失败，回退到直接 URL 编码（可能超过长度限制）
       return window.tsApi.fetchJSON(url + '?json=' + encodeURIComponent(jsonStr));
     }
   }
@@ -673,19 +698,30 @@ async function tsFetch(url) {
     }
   }
 
-  // 3. WebSocket 桥接回退
+  // 3. WebSocket 桥接回退 — 使用 wsTranslate 而非 fetch
   if (_wsReady) {
+    try {
+      var wsUrl = new URL(url);
+      var wsq = wsUrl.searchParams.get('q');
+      if (wsq) {
+        var wsResult = await wsTranslate(wsq,
+          wsUrl.searchParams.get('from') || 'en',
+          wsUrl.searchParams.get('to') || 'zh');
+        if (wsResult && wsResult.length) {
+          return { trans_result: wsResult.map(function(t){ return {dst:t}; }) };
+        }
+      }
+    } catch(e) { diag('ws fallback fail: '+e.message); }
+  }
+
+  // 4. 直接 fetch (可能被CORS拦截，仅当无 tsApi 时尝试)
+  if (!window.tsApi || typeof window.tsApi.fetchJSON !== 'function') {
     try {
       var r = await fetch(url);
       return await r.json();
-    } catch(e) { diag('ws fetch fail: '+e.message); }
+    } catch(e) { diag('direct fetch fail: '+e.message); return null; }
   }
-
-  // 4. 直接 fetch (可能被CORS拦截)
-  try {
-    var r = await fetch(url);
-    return await r.json();
-  } catch(e) { diag('direct fetch fail: '+e.message); return null; }
+  return null;
 }
 
 async function baiduBatch(texts, from, to) {
@@ -765,23 +801,38 @@ function translateQuery(text) {
 }
 
 // ===== DOM 工具 =====
+var _cachedSearchInput = null;
+var _cachedSearchInputTime = 0;
+
 function findSearchInput() {
+  // 缓存结果 800ms，避免高频轮询反复 querySelector
+  var now = Date.now();
+  if (_cachedSearchInput && now - _cachedSearchInputTime < 800 && _cachedSearchInput.isConnected) {
+    return _cachedSearchInput;
+  }
+  _cachedSearchInputTime = now;
+
   // 只在发现页/搜索页查找搜索输入框
   // 排除聊天页面的输入框 ("Search chats...", "Filter plugins...")
   var inp = document.querySelector('input[placeholder*="搜索模型"]') ||
             document.querySelector('input[placeholder*="Search models"]') ||
             document.querySelector('input[placeholder*="Discover"]') ||
             document.querySelector('input[placeholder*="Filter models"]');
-  if (inp) return inp;
+  if (inp) { _cachedSearchInput = inp; return inp; }
   // Fallback: 仅在 discover 页面查找宽输入框
-  if (!location.hash.includes('discover') && !location.hash.includes('search')) return null;
+  if (!location.hash.includes('discover') && !location.hash.includes('search')) {
+    _cachedSearchInput = null; return null;
+  }
   var all = document.querySelectorAll('input[type="text"]:not([disabled])');
   for (var i=0;i<all.length;i++){
     var ph = (all[i].placeholder || '').toLowerCase();
     // 排除聊天和插件输入
     if (ph.includes('chat') || ph.includes('plugin') || ph.includes('filter')) continue;
-    if (all[i].getBoundingClientRect().width > 200) return all[i];
+    if (all[i].getBoundingClientRect().width > 200) {
+      _cachedSearchInput = all[i]; return all[i];
+    }
   }
+  _cachedSearchInput = null;
   return null;
 }
 
@@ -1321,7 +1372,8 @@ function updateSidebarActive() {
 // ===== 路由变化清理 =====
 function onRouteChange() {
   removeTranslations();
-  _lastScrapeHash = ''; _lastSearchQuery = ''; // v2.0: 重置采集状态
+  _lastScrapeHash = ''; _lastSearchQuery = '';
+  _cachedSearchInput = null; _cachedSearchInputTime = 0; // 路由变化时使缓存失效
   updateFabState();
   updateFabVisibility();
   updateExportBtnVisibility();

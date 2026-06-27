@@ -390,6 +390,7 @@ function scrapeDiscover() {
     page: 'discover',
     url: location.hash || '/',
     timestamp: new Date().toISOString(),
+    searchQuery: getSearchQuery(),
     pageStats: { totalVisible: 0, scraped: 0, skipped: 0 },
     models: [],
   };
@@ -618,7 +619,20 @@ function proxyGet(url) {
 function proxyPost(url, body) {
   var jsonStr = typeof body === 'string' ? body : JSON.stringify(body);
   if (window.tsApi && typeof window.tsApi.fetchJSON === 'function') {
-    return window.tsApi.fetchJSON(url + '?json=' + encodeURIComponent(jsonStr));
+    // 小数据走 GET ?json=，大数据用 base64 缩短 URL
+    if (jsonStr.length < 2000) {
+      return window.tsApi.fetchJSON(url + '?json=' + encodeURIComponent(jsonStr));
+    }
+    // 大 payload: 尝试 tsApi 原生 POST（如果支持）
+    // 回退: 分段发送 或 用更紧凑的编码
+    try {
+      // 用 btoa 压缩（仅限 ASCII-safe JSON）
+      var b64 = btoa(unescape(encodeURIComponent(jsonStr)));
+      return window.tsApi.fetchJSON(url + '?b64=' + encodeURIComponent(b64));
+    } catch(e) {
+      // btoa 失败，回退到直接 URL 编码（可能超过长度限制）
+      return window.tsApi.fetchJSON(url + '?json=' + encodeURIComponent(jsonStr));
+    }
   }
   // 回退: 标准 fetch POST
   return fetch(url, {
@@ -752,10 +766,22 @@ function translateQuery(text) {
 
 // ===== DOM 工具 =====
 function findSearchInput() {
-  var inp = document.querySelector('input[placeholder*="搜索模型"]');
+  // 只在发现页/搜索页查找搜索输入框
+  // 排除聊天页面的输入框 ("Search chats...", "Filter plugins...")
+  var inp = document.querySelector('input[placeholder*="搜索模型"]') ||
+            document.querySelector('input[placeholder*="Search models"]') ||
+            document.querySelector('input[placeholder*="Discover"]') ||
+            document.querySelector('input[placeholder*="Filter models"]');
   if (inp) return inp;
+  // Fallback: 仅在 discover 页面查找宽输入框
+  if (!location.hash.includes('discover') && !location.hash.includes('search')) return null;
   var all = document.querySelectorAll('input[type="text"]:not([disabled])');
-  for (var i=0;i<all.length;i++){if(all[i].getBoundingClientRect().width>300)return all[i];}
+  for (var i=0;i<all.length;i++){
+    var ph = (all[i].placeholder || '').toLowerCase();
+    // 排除聊天和插件输入
+    if (ph.includes('chat') || ph.includes('plugin') || ph.includes('filter')) continue;
+    if (all[i].getBoundingClientRect().width > 200) return all[i];
+  }
   return null;
 }
 
@@ -1026,15 +1052,22 @@ function updatePageBtn() {
 
 // ===== 页面检测 =====
 function isDiscoverPage() {
+  // 仅通过 URL hash 判断，避免误匹配聊天页输入框
   return location.hash.includes('discover') ||
-         location.hash.includes('search') ||
-         !!findSearchInput();
+         location.hash.includes('search');
 }
 
 // ===== v2.0 DataBridge — 自动采集 + 推送到代理 =====
 var _lastScrapeHash = '';
+var _lastSearchQuery = '';
 var _scrapeTimer = null;
+var _searchWatchTimer = null;
 var _scrapeDebounceMs = 1500;
+
+function getSearchQuery() {
+  var inp = findSearchInput();
+  return inp ? (inp.value || '').trim() : '';
+}
 
 function postToProxy(data) {
   return proxyPost(PROXY_URL + '/store', data)
@@ -1054,9 +1087,11 @@ function postToProxy(data) {
 function autoScrapeIfNeeded() {
   if (!isDiscoverPage()) return;
   var currentHash = location.hash || '/';
-  // 同页面不重复采集
-  if (currentHash === _lastScrapeHash) return;
+  var currentQuery = getSearchQuery();
+  // 同页面且搜索词不变则不重复采集
+  if (currentHash === _lastScrapeHash && currentQuery === _lastSearchQuery) return;
   _lastScrapeHash = currentHash;
+  _lastSearchQuery = currentQuery;
 
   clearTimeout(_scrapeTimer);
   _scrapeTimer = setTimeout(function(){
@@ -1066,12 +1101,25 @@ function autoScrapeIfNeeded() {
       var data = window.__ts.scrape();
       // v2.0.1: 即使 0 模型也推送，附加页面诊断信息
       if (!data._debug) {
+        // 扫描页面所有输入框（诊断搜索框选择器）
+        var inputs = [];
+        var allInputs = document.querySelectorAll('input:not([type="hidden"])');
+        for (var ii = 0; ii < Math.min(allInputs.length, 8); ii++) {
+          var inp = allInputs[ii];
+          inputs.push({
+            type: inp.type || 'text',
+            placeholder: (inp.placeholder || '').substring(0, 60),
+            width: Math.round(inp.getBoundingClientRect().width),
+            visible: inp.offsetParent !== null,
+          });
+        }
         data._debug = {
           documentTitle: document.title,
           bodyTextLen: (document.body.textContent || '').length,
           mainTagCount: document.querySelectorAll('main,[class*="card"],[class*="model"],[class*="item"]').length,
           allDivs: document.querySelectorAll('div,section,article').length,
           hash: location.hash,
+          inputs: inputs,
         };
       }
       postToProxy(data);
@@ -1273,7 +1321,7 @@ function updateSidebarActive() {
 // ===== 路由变化清理 =====
 function onRouteChange() {
   removeTranslations();
-  _lastScrapeHash = ''; // v2.0: 重置采集状态，允许新页面自动采集
+  _lastScrapeHash = ''; _lastSearchQuery = ''; // v2.0: 重置采集状态
   updateFabState();
   updateFabVisibility();
   updateExportBtnVisibility();
@@ -1327,6 +1375,16 @@ function waitForReady() {
 
     // v2.0 审计定时推送
     _auditTimer = setInterval(function(){ flushAudit(); }, _auditFlushInterval);
+
+    // v2.2 搜索输入监控（1秒轮询，检测变化即时触发采集）
+    setInterval(function(){
+      if (!isDiscoverPage()) return;
+      var q = getSearchQuery();
+      if (q !== _lastSearchQuery && q.length > 0) {
+        _lastScrapeHash = ''; // 强制触发重新采集（不清_lastSearchQuery）
+        autoScrapeIfNeeded();
+      }
+    }, 1000);
 
     // 自修复轮询
     setInterval(function(){

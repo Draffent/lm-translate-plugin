@@ -31,10 +31,14 @@ async function extractJSON(req) {
     });
     return JSON.parse(body);
   }
-  // GET: 从 ?json= 参数提取
+  // GET: 从 ?json= 或 ?b64= 参数提取
   const url = new URL(req.url, 'http://localhost');
+  const b64 = url.searchParams.get('b64');
+  if (b64) {
+    return JSON.parse(Buffer.from(decodeURIComponent(b64), 'base64').toString('utf8'));
+  }
   const j = url.searchParams.get('json');
-  if (!j) throw new Error('Missing json parameter');
+  if (!j) throw new Error('Missing json or b64 parameter');
   return JSON.parse(decodeURIComponent(j));
 }
 

@@ -4,10 +4,11 @@
 
 | 项目 | 版本/信息 |
 |------|----------|
-| **LM Studio** | 0.3.10 (截至 2026-06-27) |
-| **插件版本** | v2.1.1 |
+| **LM Studio** | **0.4.18** (更新于 2026-06-27) |
+| **插件版本** | **v2.2.0** |
 | **注入点** | `resources/app/.webpack/renderer/index.html` |
 | **关键桥接** | `window.tsApi.fetchJSON` (preload注入) |
+| **Electron版本** | 38.6.0 (Chromium内核) |
 
 ## LM Studio 更新后需检查的适配点
 

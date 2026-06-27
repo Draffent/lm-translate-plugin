@@ -33,7 +33,7 @@ function audit(event, detail) {
 function flushAudit() {
   if (!_auditBuf.length) return;
   var batch = _auditBuf.splice(0, _auditBuf.length);
-  proxyPost(PROXY_URL + '/audit', batch).catch(function(){});
+  proxyPost(PROXY_URL + '/audit', batch).catch(function(e){ diag('⚠️ Audit flush failed: ' + (e.message || 'unknown')); });
 }
 
 function diag(msg) {
@@ -158,11 +158,10 @@ function updateDiagPanel() {
   if (!content) return;
   var hasTsApi = !!(window.tsApi && typeof window.tsApi.fetchJSON === 'function');
   var tsStatus = hasTsApi ? '<span style="color:#4aFF9e">● tsApi Ready</span>' :
-    '<span style="color:#f87171">● tsApi N/A</span>';
-  var wsStatus = _wsReady ? '<span style="color:#4aFF9e">● WS Connected</span>' :
-    (_ws && _ws.readyState === WebSocket.CONNECTING ? '<span style="color:#fbbf24">◐ WS Connecting...</span>' :
-    '<span style="color:#888">● WS Idle</span>');
-  var wsState = _ws ? ['CONNECTING','OPEN','CLOSING','CLOSED'][_ws.readyState] : 'null';
+    '<span style="color:#f87171">● tsApi N/A (v0.4.18)</span>';
+  var bridgeStatus = _bridgeReady ? '<span style="color:#4aFF9e">● Bridge Ready (iframe)</span>' :
+    '<span style="color:#fbbf24">◐ Bridge connecting...</span>';
+  var wsState = _bridgeReady ? 'postMessage' : 'initializing';
 
   // 检查可用API
   var apiList = [];
@@ -181,7 +180,7 @@ function updateDiagPanel() {
     } catch(e) {}
   }
   var lines = [
-    tsStatus + ' | ' + wsStatus + ' (state:'+wsState+')',
+    tsStatus + ' | ' + bridgeStatus + ' (mode:'+wsState+')',
     'Translating: '+(_translating?'yes':'no')+' | Translated: '+(_translated?'yes':'no'),
     'Pending: '+Object.keys(_wsP).length,
     'APIs: '+(apiList.length ? apiList.join(' | ') : '(none)'),
@@ -194,98 +193,100 @@ function updateDiagPanel() {
   content.innerHTML = lines.join('<br>');
 }
 
-// ===== WebSocket 桥接 =====
-function wsConnect() {
-  // tsApi 可用时跳过WebSocket
-  if (window.tsApi && typeof window.tsApi.fetchJSON === 'function') return;
-  if (_ws && _ws.readyState === WebSocket.OPEN) return;
-  diag('🔌 Connecting to ws://127.0.0.1:18999...');
-  try {
-    _ws = new WebSocket('ws://127.0.0.1:18999');
-    _ws.onopen = function() {
-      _wsReady = true;
-      diag('✅ Bridge connected!');
-      updateIndicator();
-    };
-    _ws.onmessage = function(e) {
-      try {
-        var msg = JSON.parse(e.data);
-        if (msg.type === 'pong') return;
-        if (msg.type === 'connected') { diag('📡 Welcome: v'+msg.version); return; }
-        if ((msg.type === 'result' || msg.type === 'batch_result') && msg.id && _wsP[msg.id]) {
-          var p = _wsP[msg.id];
-          clearTimeout(p.timer);
-          delete _wsP[msg.id];
-          if (msg.ok) {
-            diag('📥 Resolved: '+msg.id);
-            p.resolve(msg.type === 'batch_result' ? msg.translations : msg.data);
-          } else {
-            diag('❌ Rejected: '+msg.id+' - '+msg.error);
-            p.reject(new Error(msg.error || 'unknown'));
-          }
-        }
-      } catch(ex) {}
-    };
-    _ws.onclose = function(e) {
-      _wsReady = false;
-      diag('🔌 Disconnected (code:'+e.code+')');
-      updateIndicator();
-      for (var id in _wsP) {
-        clearTimeout(_wsP[id].timer);
-        _wsP[id].reject(new Error('WebSocket closed'));
-        delete _wsP[id];
-      }
-      _ws = null;
-      setTimeout(wsConnect, 5000);
-    };
-    _ws.onerror = function(e) {
-      diag('⚠️ WebSocket error');
-      // onclose will fire next
-    };
-  } catch(e) {
-    _wsReady = false;
-    _ws = null;
-    diag('❌ WS exception: '+e.message);
-    setTimeout(wsConnect, 10000);
+// ===== localStorage 中继 (v2.4: Electron 38 总沙箱 — CDP 轮询 localStorage) =====
+var _bridgeReady = false;
+var _bridgeConnectAttempts = 0;
+var _lsPollTimer = null;
+var _lsPending = {}; // 本地 pending (复用 _wsP 结构)
+
+function bridgeConnect() {
+  // localStorage 不依赖网络连接，始终可用
+  _bridgeReady = true;
+  if (!_lsPollTimer) {
+    _lsPollTimer = setInterval(pollLocalStorage, 300);
   }
 }
 
-function wsSend(msg) {
-  if (!_ws || _ws.readyState !== WebSocket.OPEN) return false;
-  try { _ws.send(JSON.stringify(msg)); return true; } catch(e) { return false; }
-}
-
-// 通过WebSocket发送翻译请求
-function wsTranslate(q, from, to) {
+// 发送命令到 localStorage 队列 (代理通过 CDP 轮询)
+function bridgeSend(msg) {
   return new Promise(function(resolve, reject) {
-    var id = 'r' + (++_wsSeq) + '_' + Date.now();
+    var id = msg.id || ('m' + (++_wsSeq) + '_' + Date.now());
+    msg.id = id;
     var timer = setTimeout(function() {
       delete _wsP[id];
-      reject(new Error('timeout'));
-    }, 30000);
+      reject(new Error('timeout: ' + (msg.type || 'unknown')));
+    }, 45000);
     _wsP[id] = { resolve: resolve, reject: reject, timer: timer };
-    if (!wsSend({ type: 'translate', id: id, q: q, from: from, to: to })) {
+
+    try {
+      // 从 localStorage 读取现有队列
+      var queue = [];
+      try { var raw = localStorage.getItem('__ts_cmd_queue'); if (raw) queue = JSON.parse(raw); } catch(e) {}
+      queue.push(msg);
+      // 限制队列大小
+      if (queue.length > 50) queue = queue.slice(-50);
+      localStorage.setItem('__ts_cmd_queue', JSON.stringify(queue));
+    } catch(e) {
       clearTimeout(timer);
       delete _wsP[id];
-      reject(new Error('not connected'));
+      reject(new Error('localStorage write failed: ' + e.message));
     }
   });
+}
+
+// 轮询 localStorage 响应
+function pollLocalStorage() {
+  if (Object.keys(_wsP).length === 0) return;
+  try {
+    for (var id in _wsP) {
+      var raw = localStorage.getItem('__ts_resp_' + id);
+      if (raw) {
+        var p = _wsP[id];
+        clearTimeout(p.timer);
+        delete _wsP[id];
+        localStorage.removeItem('__ts_resp_' + id);
+        try {
+          var data = JSON.parse(raw);
+          if (data && data._error) {
+            diag('❌ LS rejected: ' + id + ' - ' + data._error);
+            p.reject(new Error(data._error));
+          } else {
+            diag('📥 LS resolved: ' + id);
+            p.resolve(data);
+          }
+        } catch(e) {
+          p.resolve(raw);
+        }
+      }
+    }
+  } catch(e) {}
+}
+
+// 保持旧函数名兼容性, 改为转发到 bridge
+function wsConnect() { bridgeConnect(); }
+function wsSend(msg) { bridgeSend(msg); return true; } // 兼容返回bool
+
+function wsTranslate(q, from, to) {
+  return bridgeSend({ type: 'translate', q: q, from: from, to: to });
 }
 
 function wsBatch(texts, from, to) {
-  return new Promise(function(resolve, reject) {
-    var id = 'b' + (++_wsSeq) + '_' + Date.now();
-    var timer = setTimeout(function() {
-      delete _wsP[id];
-      reject(new Error('timeout'));
-    }, 60000);
-    _wsP[id] = { resolve: resolve, reject: reject, timer: timer };
-    if (!wsSend({ type: 'batch', id: id, texts: texts, from: from, to: to })) {
-      clearTimeout(timer);
-      delete _wsP[id];
-      reject(new Error('not connected'));
-    }
+  return bridgeSend({ type: 'batch', texts: texts, from: from, to: to }).then(function(translations) {
+    return translations;
   });
+}
+
+// v2.3: Bridge health/存储/审计 函数 (iframe postMessage)
+function wsHealth() {
+  return bridgeSend({ type: 'health' });
+}
+
+function wsStore(data) {
+  return bridgeSend({ type: 'store', data: data });
+}
+
+function wsAudit(entries) {
+  return bridgeSend({ type: 'audit', entries: entries });
 }
 
 function updateIndicator() {
@@ -298,8 +299,8 @@ function updateIndicator() {
       dot.style.cssText = 'display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;';
       fab.insertBefore(dot, fab.firstChild);
     }
-    dot.style.background = _wsReady ? '#4aFF9e' : '#f87171';
-    dot.style.boxShadow = _wsReady ? '0 0 6px #4aFF9e' : '0 0 6px #f87171';
+    dot.style.background = _bridgeReady ? '#4aFF9e' : '#f87171';
+    dot.style.boxShadow = _bridgeReady ? '0 0 6px #4aFF9e' : '0 0 6px #f87171';
   }
 }
 
@@ -520,21 +521,23 @@ window.__ts = {
   // 复制到剪贴板
   copyJSON: function(){
     var json = window.__ts.export();
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(json).then(function(){
-        audit('clipboard_copy', { size: json.length });
-        showExportToast('✅ 已复制 ' + json.length + ' 字符');
-      }).catch(function(){
-        showExportToast('❌ 复制失败，请手动选择');
-      });
-    } else {
-      // Fallback
+    function fallbackCopy() {
       var ta = document.createElement('textarea');
       ta.value = json; ta.style.cssText = 'position:fixed;left:-9999px;';
       document.body.appendChild(ta);
       ta.select();
       try { document.execCommand('copy'); showExportToast('✅ 已复制'); } catch(e) { showExportToast('❌ 复制失败'); }
       document.body.removeChild(ta);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(json).then(function(){
+        audit('clipboard_copy', { size: json.length });
+        showExportToast('✅ 已复制 ' + json.length + ' 字符');
+      }).catch(function(){
+        fallbackCopy();
+      });
+    } else {
+      fallbackCopy();
     }
   },
 };
@@ -632,34 +635,64 @@ function utf8ToBase64(str) {
 }
 
 // tsApi.fetchJSON 可以直接穿透 Electron 渲染进程网络沙箱
-// 标准 fetch/XHR/Image 在 LM Studio 中会被阻止
+// v2.3: tsApi 在 LM Studio v0.4.18 已移除, 主通道改为 WebSocket
 function proxyGet(url) {
+  // v2.3: iframe bridge 翻译优先
+  if (_bridgeReady) {
+    try {
+      var wsUrl = new URL(url, 'http://localhost');
+      var wsq = wsUrl.searchParams.get('q');
+      if (wsq) {
+        return wsTranslate(wsq,
+          wsUrl.searchParams.get('from') || 'en',
+          wsUrl.searchParams.get('to') || 'zh')
+          .then(function(translations) {
+            return { trans_result: translations.map(function(t){ return {dst:t}; }) };
+          });
+      }
+      // health check 走 ws
+      if (url.indexOf('/health') !== -1) return wsHealth();
+    } catch(e) {}
+  }
+  // 回退 1: tsApi (仅 v0.3.x 旧版本)
   if (window.tsApi && typeof window.tsApi.fetchJSON === 'function') {
     return window.tsApi.fetchJSON(url);
   }
-  // 回退: 标准 fetch
+  // 回退 2: 标准 fetch (Electron 38 大概率被封)
   return fetch(url).then(function(r){ return r.json(); });
 }
 
 function proxyPost(url, body) {
   var jsonStr = typeof body === 'string' ? body : JSON.stringify(body);
+  // v2.3: iframe bridge 优先
+  if (_bridgeReady) {
+    try {
+      var data = typeof body === 'string' ? JSON.parse(body) : body;
+      if (url.indexOf('/store') !== -1) {
+        return wsStore(data);
+      } else if (url.indexOf('/batch') !== -1) {
+        var texts = data.texts || [];
+        return wsBatch(texts, data.from || 'en', data.to || 'zh').then(function(translations) {
+          return { ok: true, translations: translations };
+        });
+      } else if (url.indexOf('/audit') !== -1) {
+        return wsAudit(Array.isArray(data) ? data : [data]);
+      }
+    } catch(e) { diag('ws proxyPost fail: ' + e.message); }
+  }
+  // 回退 1: tsApi
   if (window.tsApi && typeof window.tsApi.fetchJSON === 'function') {
-    // 小数据走 GET ?json=，大数据用 base64 缩短 URL
     if (jsonStr.length < 2000) {
       return window.tsApi.fetchJSON(url + '?json=' + encodeURIComponent(jsonStr));
     }
-    // 大 payload: 尝试 tsApi 原生 POST（如果支持）
-    // 回退: 分段发送 或 用更紧凑的编码
     try {
-      // 用 utf8ToBase64 压缩（不做 unescape，安全替代方案）
       var b64 = utf8ToBase64(jsonStr);
       return window.tsApi.fetchJSON(url + '?b64=' + encodeURIComponent(b64));
     } catch(e) {
-      // base64 失败，回退到直接 URL 编码（可能超过长度限制）
       return window.tsApi.fetchJSON(url + '?json=' + encodeURIComponent(jsonStr));
     }
   }
-  // 回退: 标准 fetch POST
+  // 回退 2: 标准 fetch POST
   return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -987,7 +1020,7 @@ async function doInlineTranslate(btn) {
         'font-size:0.88em;line-height:1.5;'+
         'color:#93c5fd;font-family:system-ui,-apple-system,sans-serif;';
       trSpan.innerHTML = '<span style="color:#4a9eff;font-size:0.8em;margin-right:4px;">🇨🇳</span>' +
-        zh.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        zh.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 
       // 纯追加 — 不移动任何现有元素
       el.appendChild(trSpan);
@@ -1417,8 +1450,8 @@ function waitForReady() {
       diag('🟡 tsApi exists but no ping method (old preload)');
     }
 
-    // 先连接WebSocket桥接
-    wsConnect();
+    // 先连接iframe桥接
+    bridgeConnect();
     injectAll();
 
     // 检查代理连通性，无论成功与否2秒后自动隐藏面板
@@ -1441,7 +1474,7 @@ function waitForReady() {
     // 自修复轮询
     setInterval(function(){
       checkProxyHealth();
-      if (!_wsReady) wsConnect();
+      if (!_bridgeReady) bridgeConnect();
       injectSearchBtn();
       injectPageBtn();
       injectSidebarBtn();
